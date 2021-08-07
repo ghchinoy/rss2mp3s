@@ -19,6 +19,3 @@ Here's a [video](https://threadit.app/thread/plpazglp38ddilsidl5g/message/s4m04b
 
 * Apple Podcasts https://podcasters.apple.com/support/823-podcast-requirements
 * Google Podcasts https://support.google.com/podcast-publishers/answer/9889544?hl=en
-
-
-w
