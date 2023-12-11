@@ -1,12 +1,14 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -14,60 +16,105 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("please provide an RSS URL")
-		fmt.Println("ex. rss2mp3s https://www.robotread.me/podcast/index.xml")
-		os.Exit(1)
+	max := flag.Int("max", 0, "Max number of episodes to download. Default is all episodes.")
+	retries := flag.Int("retries", 0, "Maximum number of retries for a failed download. Default is 0.")
+	parallel := flag.Int("parallel", 1, "Set the download parallelism. Default is 1.")
+	uri := flag.String("rss", "", "rss feed URL")
+	flag.Parse()
+
+	if *parallel < 1 {
+		log.Fatalf("Invalid parallelism value: %d", *parallel)
 	}
-	feedurl := os.Args[1]
-	if feedurl == "" {
-		feedurl = "https://www.robotread.me/podcast/index.xml"
-	}
-	u, err := url.Parse(feedurl)
+
+	feedUrl, err := url.Parse(*uri)
 	if err != nil {
-		log.Printf("couldn't read the url: %v", err)
-		os.Exit(1)
+		fmt.Printf("Error parsing URL: %v\n", err)
+		return
 	}
+
 	var rss readfeed.RSS
-	err = rss.Read(u)
+	err = rss.Read(feedUrl)
 	if err != nil {
 		log.Printf("couldn't parse url into rss feed: %v", err)
 		os.Exit(1)
 	}
+
 	log.Printf("ok, rss (%d): '%s'", rss.Length, rss.Channel.Title)
+
+	limitChan := make(chan bool, *parallel)
 	var waitGroup sync.WaitGroup
-	log.Printf("Found %d items", len(rss.Channel.Items))
-	for _, items := range rss.Channel.Items {
-		//log.Printf("beginning download of %s", items.Title)
-		waitGroup.Add(1)
-		go downloadEnclosure(items.Title, items.Enclosure.URL, &waitGroup)
+
+	if *max > 0 {
+		log.Printf("Found %d items but downloading %d", len(rss.Channel.Items), *max)
+	} else {
+		log.Printf("Downloading all %d episodes.", len(rss.Channel.Items))
 	}
+
+	for cnt, items := range rss.Channel.Items {
+		if *max > 0 && cnt >= *max {
+			break
+		}
+		waitGroup.Add(1)
+		limitChan <- true
+
+		go func(title, enclosureURL string) {
+			downloadEnclosure(title, enclosureURL, *retries, 0)
+			<-limitChan
+			waitGroup.Done()
+		}(items.Title, items.Enclosure.URL)
+	}
+
 	waitGroup.Wait()
 }
 
 // downloadEnclosure downloads the target enclosure URL to a local file
-func downloadEnclosure(title, enclosureURL string, wg *sync.WaitGroup) {
-	defer wg.Done()
+func downloadEnclosure(title, enclosureURL string, retry int, attempt int) {
+	title = strings.TrimSpace(title)
 
-	// create a name for the file from the URL
+	if attempt > retry {
+		log.Fatalf("Too many retries for title %s. Aborting!", title)
+		os.Exit(1)
+	}
+
+	// create a filename from the track title and suffix
 	parts := strings.Split(enclosureURL, "/")
-	filename := parts[len(parts)-1:][0]
+	extFilename := parts[len(parts)-1:][0]
+	filename := title + filepath.Ext(extFilename)
+
 	var writer io.WriteCloser
 	writer, err := os.Create(filename)
 	if err != nil {
-		log.Printf("unable to create output file '%s': %v", filename, err)
+		if attempt < retry {
+			log.Printf("Error downloading title %s: %v. Retrying...", title, err)
+			downloadEnclosure(title, enclosureURL, retry, attempt+1)
+		} else {
+			panic(err)
+		}
 		return
 	}
 	defer writer.Close()
 
 	r, err := http.Get(enclosureURL)
-	if err != nil {
-		fmt.Println(err)
+	if err != nil || r.StatusCode != http.StatusOK {
+		if attempt < retry {
+			log.Printf("Error downloading title %s: %v. Retrying...", title, err)
+			downloadEnclosure(title, enclosureURL, retry, attempt+1)
+		} else {
+			panic(err)
+		}
 		return
 	}
-	io.Copy(writer, r.Body)
-	if err = r.Body.Close(); err != nil {
-		fmt.Println(err)
+
+	_, err = io.Copy(writer, r.Body)
+	if errClose := r.Body.Close(); err != nil || errClose != nil {
+		if attempt < retry {
+			log.Printf("Error downloading title %s: %v. Retrying...", title, err)
+			downloadEnclosure(title, enclosureURL, retry, attempt+1)
+		} else {
+			panic(err)
+		}
+		return
 	}
+
 	log.Printf("Downloaded '%s' as %s", title, filename)
 }
